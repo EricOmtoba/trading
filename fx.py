@@ -1,228 +1,426 @@
 import os
-from dotenv import load_dotenv
-import paypalrestsdk
+from flask import Flask, render_template, request, redirect, url_for, flash
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from flask_sqlalchemy import SQLAlchemy
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
 import logging
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import smtplib
 from email.mime.text import MIMEText
-from sklearn.ensemble import RandomForestClassifier
+from email.mime.multipart import MIMEMultipart
+import pandas as pd
 import numpy as np
+from oandapyV20 import API
+import oandapyV20.endpoints.instruments as instruments
+import oandapyV20.endpoints.trades as trades
 
-# Load environment variables
-load_dotenv()
+# Initialize Flask App
+app = Flask(_name_)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL", "sqlite:///trading.db")
+app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "supersecretkey")
+db = SQLAlchemy(app)
 
-# PayPal Configuration
-paypalrestsdk.configure({
-    "mode": os.getenv("PAYPAL_MODE", "sandbox"),
-    "client_id": os.getenv("PAYPAL_CLIENT_ID"),
-    "client_secret": os.getenv("PAYPAL_CLIENT_SECRET"),
-})
+# Logging Setup
+logging.basicConfig(filename='trading_app.log', level=logging.INFO)
 
-# Logging Configuration
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Flask-Login Setup
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = "login"
 
-# Parameters
-profit_threshold = 1000
-profit_to_transfer = 200
-recipient_email = "recipient_email@example.com"
+# Flask-Limiter Setup (Rate Limiting)
+limiter = Limiter(app, key_func=get_remote_address, default_limits=["5 per minute"])
 
-# Function: Predict trade signals using machine learning
-def predict_trade_signals(data):
-    # Placeholder ML model (RandomForest)
-    model = RandomForestClassifier()
+# OANDA API Setup (Use environment variables)
+OANDA_ACCESS_TOKEN = os.getenv("OANDA_ACCESS_TOKEN")
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
+api = API(access_token=OANDA_ACCESS_TOKEN)
+
+
+### DATABASE MODELS ###
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(150), unique=True, nullable=False)
+    password_hash = db.Column(db.String(200), nullable=False)
+    role = db.Column(db.String(50), default="user")  # Can be "admin", "trader"
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+
+class Trade(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    pair = db.Column(db.String(10), nullable=False)
+    action = db.Column(db.String(10), nullable=False)
+    units = db.Column(db.Integer, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+# Load User
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+
+### HELPER FUNCTIONS ###
+def get_forex_data(pair, count=100):
+    """ Fetch forex data from OANDA API. """
+    params = {"count": count, "granularity": "M1"}
+    r = instruments.InstrumentsCandles(instrument=pair, params=params)
+    api.request(r)
+    return r.response
+
+
+def moving_average_crossover_strategy(pair, data):
+    """ Implements a simple Moving Average Crossover Strategy. """
+    df = pd.DataFrame(data['candles'])
+    df['time'] = pd.to_datetime(df['time'])
+    df.set_index('time', inplace=True)
+    df['SMA_50'] = df['mid']['c'].rolling(window=50).mean()
+    df['SMA_200'] = df['mid']['c'].rolling(window=200).mean()
     
-    # Simulate training data
-    X_train = np.random.rand(100, 4)  # Random features
-    y_train = np.random.choice([0, 1], size=100)  # Buy/Sell labels
-    model.fit(X_train, y_train)
+    df['signal'] = np.where(df['SMA_50'] > df['SMA_200'], 1, -1)
+    df['positions'] = df['signal'].diff()
+    return df
 
-    # Predict on new data
-    X_new = np.array(data).reshape(1, -1)  # Ensure input is 2D
-    prediction = model.predict(X_new)[0]  # 0 = Sell, 1 = Buy
-    return "Buy" if prediction == 1 else "Sell"
 
-# Function: Get real-time profit
-def get_real_time_profit(trading_data):
-    total_revenue = sum([trade['profit'] for trade in trading_data])
-    total_costs = sum([trade['cost'] for trade in trading_data])
-    return total_revenue - total_costs
-
-# Function: Transfer funds
-def transfer_funds(amount):
-    try:
-        payout = paypalrestsdk.Payout({
-            "sender_batch_header": {
-                "sender_batch_id": "batch_" + str(int(amount)),
-                "email_subject": "Profit Transfer Notification"
-            },
-            "items": [
-                {
-                    "recipient_type": "EMAIL",
-                    "amount": {"value": f"{amount}", "currency": "USD"},
-                    "receiver": recipient_email,
-                    "note": "Automated profit transfer"
-                }
-            ]
-        })
-
-        if payout.create(sync_mode=True):
-            logging.info(f"Payout created successfully. Batch ID: {payout.batch_header.payout_batch_id}")
-            return True
-        else:
-            logging.error(f"Error creating payout: {payout.error}")
-            return False
-    except Exception as e:
-        logging.error(f"Exception during payout: {e}")
-        return False
-
-# Function: Send email notifications
-def send_email_notification(amount):
-    sender_email = "your_email@example.com"
-    sender_password = "your_email_password"
-    smtp_server = "smtp.gmail.com"
-    port = 587
-
-    try:
-        msg = MIMEText(f"A profit transfer of ${amount} has been sent to {recipient_email}.")
-        msg["Subject"] = "Profit Transfer Notification"
-        msg["From"] = sender_email
-        msg["To"] = recipient_email
-
-        with smtplib.SMTP(smtp_server, port) as server:
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, recipient_email, msg.as_string())
-        logging.info("Notification email sent successfully.")
-    except Exception as e:
-        logging.error(f"Failed to send email notification: {e}")
-
-# Function: Monitor profit and automate transfer
-def monitor_profit_and_transfer(trading_data):
-    total_profit = get_real_time_profit(trading_data)
-
-    if total_profit >= profit_threshold:
-        logging.info(f"Profit threshold reached: ${total_profit}")
-        if transfer_funds(profit_to_transfer):
-            send_email_notification(profit_to_transfer)
-        else:
-            logging.error("Transfer failed.")
-    else:
-        logging.info(f"Current profit (${total_profit}) is below the threshold.")
-
-# Example Usage
-if __name__ == "__main__":
-    # Simulated trading data
-    trading_data = [
-        {"trade_id": 1, "profit": 500, "cost": 50},
-        {"trade_id": 2, "profit": 700, "cost": 100}
-    ]
-
-    # Example data for ML prediction
-    new_trade_data = [0.6, 0.8, 0.5, 0.7]  # Random feature values
-    trade_signal = predict_trade_signals(new_trade_data)
-    logging.info(f"Predicted trade signal: {trade_signal}")
-
-    # Monitor profit and trigger automated actions
-    monitor_profit_and_transfer(trading_data)
-import os
-import asyncio
-import logging
-import streamlit as st
-from dotenv import load_dotenv
-from api_connections import TradingPlatform  # Modularized API logic
-from ai_recommendations import TradeRecommender  # AI recommendation module
-from rate_limiter import RateLimiter  # Rate limiting utility
-from report_generator import generate_trade_report  # Report generation
-
-# Load environment variables
-load_dotenv()
-
-# Logger setup
-logging.basicConfig(
-    filename="trading_app.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-
-# Global configuration
-PLATFORM_CREDENTIALS = {
-    "Robinhood": {
-        "username": os.getenv("ROBINHOOD_USERNAME"),
-        "password": os.getenv("ROBINHOOD_PASSWORD"),
-    },
-    "Alpaca": {
-        "api_key": os.getenv("ALPACA_API_KEY"),
-        "secret_key": os.getenv("ALPACA_SECRET_KEY"),
-    },
-    "Binance": {
-        "api_key": os.getenv("BINANCE_API_KEY"),
-        "secret_key": os.getenv("BINANCE_API_SECRET"),
-    },
-}
-
-# Initialize rate limiter
-rate_limiter = RateLimiter(rate=5, per_seconds=60)  # Limit 5 requests per minute
-
-# AI Recommendations module
-trade_recommender = TradeRecommender()
-
-# Streamlit UI
-def render_ui():
-    st.title("Multi-Platform Trading App")
-    st.sidebar.header("Navigation")
-    page = st.sidebar.radio("Select a Page", ["Trade Execution", "Portfolio View", "Reports", "Recommendations"])
-
-    if page == "Trade Execution":
-        trade_execution_page()
-    elif page == "Portfolio View":
-        portfolio_view_page()
-    elif page == "Reports":
-        reports_page()
-    elif page == "Recommendations":
-        recommendations_page()
-
-def trade_execution_page():
-    st.subheader("Execute Trades")
-    platform = st.selectbox("Choose Platform", PLATFORM_CREDENTIALS.keys())
-    symbol = st.text_input("Enter Stock/Crypto Symbol")
-    action = st.selectbox("Action", ["BUY", "SELL"])
-    quantity = st.number_input("Quantity", min_value=1, step=1)
+def send_email(subject, body, to_email):
+    """ Securely send email notifications. """
+    from_email = os.getenv("EMAIL_USER")
+    from_password = os.getenv("EMAIL_PASS")
     
-    if st.button("Execute Trade"):
-        if symbol and quantity > 0:
-            st.write(f"Processing {action} order for {quantity} of {symbol} on {platform}...")
-            asyncio.run(execute_trade(platform, symbol, action, quantity))
-        else:
-            st.error("Please enter valid details.")
-
-def portfolio_view_page():
-    st.subheader("Portfolio View")
-    st.write("Fetching portfolio details...")
-    # Fetch and display portfolio details dynamically
-    # Example: portfolio = trading_platform.get_portfolio()
-    # st.write(portfolio)
-
-def reports_page():
-    st.subheader("Trade Reports")
-    st.write("Generating trade execution reports...")
-    report_path = generate_trade_report()
-    st.download_button("Download Report", file_name=report_path, data=open(report_path, "rb"))
-
-def recommendations_page():
-    st.subheader("AI Trade Recommendations")
-    recommendations = trade_recommender.get_recommendations()
-    st.write(recommendations)
-
-async def execute_trade(platform, symbol, action, quantity):
+    msg = MIMEMultipart()
+    msg['From'] = from_email
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+    
     try:
-        rate_limiter.check_limit()
-        trading_platform = TradingPlatform(PLATFORM_CREDENTIALS[platform])
-        await trading_platform.login()
-        await trading_platform.trade(symbol, action, quantity)
-        st.success(f"Successfully executed {action} order for {quantity} {symbol} on {platform}.")
-        logging.info(f"Trade executed: {action} {quantity} {symbol} on {platform}")
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(from_email, from_password)
+        server.sendmail(from_email, to_email, msg.as_string())
+        server.quit()
     except Exception as e:
-        st.error(f"Failed to execute trade: {e}")
-        logging.error(f"Trade error: {e}")
+        logging.error(f"Failed to send email: {e}")
+
+
+### BACKGROUND TASKS ###
+scheduler = BackgroundScheduler()
+scheduler.start()
+
+def send_daily_report():
+    """ Sends a daily trading report via email. """
+    trades = Trade.query.filter(Trade.timestamp >= datetime.utcnow() - timedelta(days=1)).all()
+    report = "\n".join([f"Pair: {t.pair}, Action: {t.action}, Units: {t.units}, Time: {t.timestamp}" for t in trades])
+    
+    send_email("Daily Trading Report", report, "user@example.com")
+
+scheduler.add_job(send_daily_report, 'cron', hour=23, minute=59)
+
+
+### ROUTES ###
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        user = User.query.filter_by(username=request.form['username']).first()
+        if user and user.check_password(request.form['password']):
+            login_user(user)
+            return redirect(url_for('home'))
+        else:
+            flash("Invalid username or password", "danger")
+    return render_template('login.html')
+
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('home'))
+
+
+@app.route('/trade', methods=['POST'])
+@login_required
+@limiter.limit("5 per minute")
+def trade():
+    """ Handles trade execution securely. """
+    pair = request.form['pair']
+    action = request.form['action']
+    units = request.form['units']
+    
+    # Validate inputs
+    allowed_pairs = ["EUR/USD", "USD/JPY", "GBP/USD"]
+    if pair not in allowed_pairs:
+        return "Invalid currency pair", 400
+    if action not in ["buy", "sell"]:
+        return "Invalid action", 400
+    try:
+        units = int(units)
+        if units <= 0:
+            return "Invalid unit amount", 400
+    except ValueError:
+        return "Units must be a number", 400
+
+    # Check user role
+    if current_user.role != "trader":
+        return "Access Denied", 403
+
+    # Store trade in database
+    trade = Trade(user_id=current_user.id, pair=pair, action=action, units=units)
+    db.session.add(trade)
+    db.session.commit()
+
+    # Execute trade on OANDA
+    trade_exec = trades.TradeCreate(accountID=OANDA_ACCOUNT_ID, data={
+        "order": {
+            "units": str(units),
+            "instrument": pair,
+            "timeInForce": "FOK",
+            "type": "MARKET",
+            "positionFill": "DEFAULT"
+        }
+    })
+    api.request(trade_exec)
+
+    logging.info(f"Trade executed: Pair={pair}, Action={action}, Units={units}")
+    return redirect(url_for('home'))
+
+
+### APP START ###
+if _name_ == '_main_':
+    db.create_all()  # Ensure database is initialized
+    app.run(ssl_context=('cert.pem', 'key.pem'))  # Run with HTTPS
+    @app.route('/trade', methods=['POST'])
+@login_required
+@limiter.limit("5 per minute")
+def trade():
+    """ Handles trade execution securely with Stop Loss and Take Profit. """
+    pair = request.form['pair']
+    action = request.form['action']
+    units = request.form['units']
+    stop_loss = request.form.get('stop_loss', None)
+    take_profit = request.form.get('take_profit', None)
+    
+    # Validate inputs
+    allowed_pairs = ["EUR/USD", "USD/JPY", "GBP/USD"]
+    if pair not in allowed_pairs:
+        return "Invalid currency pair", 400
+    if action not in ["buy", "sell"]:
+        return "Invalid action", 400
+    try:
+        units = int(units)
+        if units <= 0:
+            return "Invalid unit amount", 400
+    except ValueError:
+        return "Units must be a number", 400
+
+    if stop_loss:
+        try:
+            stop_loss = float(stop_loss)
+        except ValueError:
+            return "Invalid Stop Loss value", 400
+
+    if take_profit:
+        try:
+            take_profit = float(take_profit)
+        except ValueError:
+            return "Invalid Take Profit value", 400
+
+    # Check user role
+    if current_user.role != "trader":
+        return "Access Denied", 403
+
+    # Store trade in database
+    trade = Trade(user_id=current_user.id, pair=pair, action=action, units=units)
+    db.session.add(trade)
+    db.session.commit()
+from flask import Flask, render_template, request, redirect, url_for, flash
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import UserMixin, login_required, current_user
+import time
+import threading
+from datetime import datetime
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///database.db'
+db = SQLAlchemy(app)
+
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(150), nullable=False, unique=True)
+    email = db.Column(db.String(150), nullable=False, unique=True)
+    password = db.Column(db.String(150), nullable=False)
+
+class Trade(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    pair = db.Column(db.String(10))
+    action = db.Column(db.String(5))
+    units = db.Column(db.Integer)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+class UserPreferences(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    preferred_pair = db.Column(db.String(10), nullable=False)
+    update_frequency = db.Column(db.Integer, default=30)  # Default update frequency (in seconds)
+
+# Function to get market data (simplified)
+def get_forex_data(pair):
+    # Mocked data for demonstration purposes
+    return {'candles': [{'mid': {'c': 1.2}}]}  # Simplified API response
+
+@app.route('/')
+@login_required
+def dashboard():
+    """ Displays the trading dashboard. """
+    return render_template('dashboard.html')
+
+@app.route('/preferences', methods=['GET', 'POST'])
+@login_required
+def preferences():
+    if request.method == 'POST':
+        preferred_pair = request.form['preferred_pair']
+        update_frequency = request.form['update_frequency']
+        user_prefs = UserPreferences.query.filter_by(user_id=current_user.id).first()
+        if user_prefs:
+            user_prefs.preferred_pair = preferred_pair
+            user_prefs.update_frequency = int(update_frequency)
+        else:
+            user_prefs = UserPreferences(user_id=current_user.id, preferred_pair=preferred_pair, update_frequency=int(update_frequency))
+            db.session.add(user_prefs)
+        db.session.commit()
+        flash("Preferences updated successfully.", "success")
+        return redirect(url_for('preferences'))
+    user_prefs = UserPreferences.query.filter_by(user_id=current_user.id).first()
+    return render_template('preferences.html', preferences=user_prefs)
+
+@app.route('/trading-history')
+@login_required
+def trading_history():
+    trades = Trade.query.filter_by(user_id=current_user.id).all()
+    return render_template('trading_history.html', trades=trades)
+
+# Market data updates and trade execution (simplified for demonstration)
+def market_data_update():
+    while True:
+        pair = "EUR/USD"
+        data = get_forex_data(pair)
+        price = data['candles'][-1]['mid']['c']
+        socketio.emit('market_data', {'price': price, 'time': datetime.utcnow().strftime('%H:%M:%S')}, broadcast=True)
+        time.sleep(30)
 
 if __name__ == "__main__":
-    render_ui()
+    app.run(debug=True)
+
+    # Construct trade data for OANDA API
+    trade_data = {
+        "order": {
+            "units": str(units),
+            "instrument": pair,
+            "timeInForce": "FOK",
+            "type": "MARKET",
+            "positionFill": "DEFAULT"
+        }
+    }
+
+    # Add SL & TP if provided
+    if stop_loss:
+        trade_data["order"]["stopLossOnFill"] = {"price": str(stop_loss)}
+    if take_profit:
+        trade_data["order"]["takeProfitOnFill"] = {"price": str(take_profit)}
+
+    # Execute trade on OANDA
+    trade_exec = trades.TradeCreate(accountID=OANDA_ACCOUNT_ID, data=trade_data)
+    api.request(trade_exec)
+
+    logging.info(f"Trade executed: Pair={pair}, Action={action}, Units={units}, SL={stop_loss}, TP={take_profit}")
+    return redirect(url_for('home'))
+    
+def calculate_atr(pair, period=14):
+    """ Calculate Average True Range (ATR) for volatility-based Stop Loss. """
+    data = get_forex_data(pair, count=period+1)
+    df = pd.DataFrame(data['candles'])
+    df['high'] = df['mid']['h'].astype(float)
+    df['low'] = df['mid']['l'].astype(float)
+    df['close'] = df['mid']['c'].astype(float)
+
+    df['tr'] = np.maximum(df['high'] - df['low'], 
+                           np.maximum(abs(df['high'] - df['close'].shift(1)), 
+                                      abs(df['low'] - df['close'].shift(1))))
+    atr = df['tr'].rolling(window=period).mean().iloc[-1]
+    return round(atr, 5)  # Return ATR value as stop loss in pips
+
+def calculate_position_size(account_balance, pair, risk_percent=1):
+    """ Determine position size based on risk percentage. """
+    atr = calculate_atr(pair)
+    pip_value = 1  # Assume $1 per pip for a standard lot (adjust if needed)
+    
+    risk_amount = account_balance * (risk_percent / 100)
+    lot_size = risk_amount / (atr * pip_value)
+
+    return round(lot_size, 2)  # Round to 2 decimal places for micro lots
+
+@app.route('/trade', methods=['POST'])
+@login_required
+def trade():
+    """ Executes trades with automatic position sizing. """
+    pair = request.form['pair']
+    action = request.form['action']
+    account_balance = 200  # Example balance (could be dynamically fetched)
+
+    # Calculate position size
+    lot_size = calculate_position_size(account_balance, pair)
+
+    # Calculate SL & TP
+    atr = calculate_atr(pair)
+    stop_loss = round(float(get_forex_data(pair, count=1)['candles'][-1]['mid']['c']) - atr, 5)
+    take_profit = round(stop_loss + (atr * 2), 5)  # 1:2 RRR
+
+    # Execute trade
+    trade_data = {
+        "order": {
+            "units": str(lot_size),
+            "instrument": pair,
+            "timeInForce": "FOK",
+            "type": "MARKET",
+            "positionFill": "DEFAULT",
+            "stopLossOnFill": {"price": str(stop_loss)},
+            "takeProfitOnFill": {"price": str(take_profit)}
+        }
+    }
+
+    trade_exec = trades.TradeCreate(accountID=OANDA_ACCOUNT_ID, data=trade_data)
+    api.request(trade_exec)
+
+    return f"Trade placed: {pair} | {action} | {lot_size} lots | SL: {stop_loss} | TP: {take_profit}"
+    <!-- dashboard.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.socket.io/4.0.1/socket.io.min.js"></script>
+</head>
+<body>
+    <h1>Trading Dashboard</h1>
+    <div>
+        <h2>Real-Time Forex Chart</h2>
+        <canvas id="priceChart" width="400" height="200"></canvas>
+    </div>
+</body>
+</html>
+
